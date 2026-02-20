@@ -21,6 +21,7 @@ pub mod util;
 
 use error::GamploError;
 use serde_json::json;
+#[cfg(feature = "client")]
 use web_sys::{js_sys::Reflect, wasm_bindgen::JsValue};
 
 use crate::{
@@ -93,12 +94,20 @@ impl Gamplo {
         };
         Ok((client_struct, parsed.player))
     }
-    /// Creates a new Gamplo client using an auto-detected token.
+    /// Creates a new Gamplo client using the token stored in `window.GAMPLO_TOKEN`, if any.
+    /// 
+    /// For server use or for when you want to provide the token explicitly, use [`Gamplo::from_token`] or [`Gamplo::from_token_with_player`] instead.
+    /// See also: [`get_token`] for getting the token from `window.GAMPLO_TOKEN` directly.
+    #[cfg(feature = "client")]
     pub async fn new() -> Result<Self, GamploError> {
         let token = get_token()?;
         Self::from_token(token).await
     }
-    /// Creates a new Gamplo client using an auto-detected token and also returns the authenticated player if available.
+    /// Creates a new Gamplo client using the token stored in `window.GAMPLO_TOKEN` (if any) and also returns the authenticated player if available.
+    /// 
+    /// For server use or for when you want to provide the token explicitly, use [`Gamplo::from_token_with_player`] instead.
+    /// See also: [`get_token`] for getting the token from `window.GAMPLO_TOKEN` directly.
+    #[cfg(feature = "client")]
     pub async fn new_with_player() -> Result<(Self, Option<Player>), GamploError> {
         let token = get_token()?;
         Self::from_token_with_player(token).await
@@ -364,10 +373,11 @@ impl ModerationResult {
     }
 }
 
-/// Attempts to get the Gamplo authentication token.
+/// Attempts to get the Gamplo authentication token from the `window.GAMPLO_TOKEN` variable.
 ///
 /// This function always returns an error as token auto-detection is disabled.
 /// Use [`Gamplo::from_token`] to provide a token explicitly.
+#[cfg(feature = "client")]
 pub fn get_token() -> Result<String, GamploError> {
     let window = web_sys::window().ok_or_else(|| GamploError::TokenNotFound(String::from("Failed to get window object")))?;
     let url = Reflect::get(&window, &JsValue::from_str("GAMPLO_TOKEN")).map_err(|_| GamploError::TokenNotFound(String::from("Failed to access GAMPLO_TOKEN from window")))?;
