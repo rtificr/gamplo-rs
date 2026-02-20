@@ -1,61 +1,78 @@
+//! Gamplo SDK for Rust
+//! 
+//! Provides a Rust interface for the Gamplo API.
+//! Based on [Gamplo's JavaScript SDK](https://gamplo.com/developer/sdk) and is designed to be used in both server-side and client-side (WASM) Gamplo games.
+//! For more information/examples, [read the SDK documentation](https://gamplo.com/developer/sdk)
+//! 
+//! # Features
+//! - `client`: Enables client-side (WASM) functionality
+//! - `server`: Enables server-side functionality
+
+#[cfg(all(feature = "client", feature = "server"))]
+compile_error!("feature \"client\" and feature \"server\" cannot be enabled at the same time");
+#[cfg(not(any(feature = "client", feature = "server")))]
+compile_error!("either feature \"client\" or feature \"server\" must be enabled");
+
 pub mod achievement;
+pub mod error;
 pub mod player;
 pub mod save;
+pub mod util;
 
-use anyhow::anyhow;
+use error::GamploError;
 use serde_json::json;
+use web_sys::{js_sys::Reflect, wasm_bindgen::JsValue};
 
 use crate::{
-    achievement::AchievementUnlockResponse,
+    achievement::{Achievement, AchievementUnlockResponse},
     player::Player,
-    save::{SaveData, Saves},
+    save::{SaveData, SaveWriteResponse, Saves},
+    util::get_error,
 };
 
-pub const URL: &str = "https://gamplo.com";
-fn base_url() -> String {
-    if let Ok(env) = std::env::var("GAMPLO_BASE_URL") {
-        return env;
-    }
-    // On WASM, allow `?gamplo_base=...` override for local proxy/dev
-    #[cfg(target_arch = "wasm32")]
-    {
-        if let Some(window) = web_sys::window() {
-            let location = window.location();
-            if let Ok(search) = location.search() {
-                let query = url::form_urlencoded::parse(search.as_bytes()).collect::<Vec<_>>();
-                if let Some((_, v)) = query.into_iter().find(|(k, _)| k == "gamplo_base") {
-                    return v.into_owned();
-                }
-            }
-        }
-    }
-    URL.to_string()
+/// The URL for gamplo.com.
+pub const GAMPLO_URL: &str = "https://gamplo.com";
+
+fn evaluate_url_path(path: &str) -> String {
+    format!("{}{}", GAMPLO_URL, path)
 }
-pub fn url_path(path: &str) -> String {
-    base_url() + path
-}
+
+/// Main Gamplo client struct for interacting with the Gamplo API.
 #[derive(Debug, Clone)]
-pub struct GamploClient {
+pub struct Gamplo {
     session_id: String,
     client: reqwest::Client,
 }
-impl GamploClient {
-    pub async fn from_token(token: String) -> anyhow::Result<Self> {
+impl Gamplo {
+    /// Creates a new Gamplo client from an authentication token.
+    pub async fn from_token(token: String) -> Result<Self, GamploError> {
         Ok(Self::from_token_with_player(token).await?.0)
     }
-
-    pub async fn from_token_with_player(token: String) -> anyhow::Result<(Self, Option<Player>)> {
+    /// Creates a new Gamplo client from an authentication token, and also returns the authenticated player if available.
+    pub async fn from_token_with_player(
+        token: String,
+    ) -> Result<(Self, Option<Player>), GamploError> {
         let client = reqwest::Client::new();
         let text = client
-            .post(url_path("/api/sdk/auth"))
+            .post(evaluate_url_path("/api/sdk/auth"))
             .header("Content-Type", "application/json")
             .body(json!({ "token": token }).to_string())
             .send()
-            .await
-            .map_err(|e| anyhow!("Failed to send auth request: {:?}", e))?
+            .await?
             .text()
-            .await
-            .map_err(|e| anyhow!("Error receiving text: {:?}", e))?;
+            .await?;
+
+        if let Some(error) =
+            get_error(
+                &serde_json::from_str(&text).map_err(|e| GamploError::Deserialization {
+                    type_name: "auth error response".to_string(),
+                    data: text.clone(),
+                    source: e,
+                })?,
+            )
+        {
+            return Err(GamploError::Authentication(error));
+        }
 
         #[derive(serde::Deserialize)]
         struct AuthResponse {
@@ -63,29 +80,34 @@ impl GamploClient {
             session_id: String,
             player: Option<Player>,
         }
+        let parsed: AuthResponse =
+            serde_json::from_str(&text).map_err(|e| GamploError::Deserialization {
+                type_name: "AuthResponse".to_string(),
+                data: text.clone(),
+                source: e,
+            })?;
 
-        let parsed: AuthResponse = serde_json::from_str(&text)
-            .map_err(|e| anyhow!("Failed to parse auth response: {:?}, error: {:?}", text, e))?;
-
-        let client_struct = GamploClient {
+        let client_struct = Gamplo {
             session_id: parsed.session_id,
             client,
         };
         Ok((client_struct, parsed.player))
     }
-    pub async fn new() -> anyhow::Result<Self> {
+    /// Creates a new Gamplo client using an auto-detected token.
+    pub async fn new() -> Result<Self, GamploError> {
         let token = get_token()?;
         Self::from_token(token).await
     }
-
-    pub async fn new_with_player() -> anyhow::Result<(Self, Option<Player>)> {
+    /// Creates a new Gamplo client using an auto-detected token and also returns the authenticated player if available.
+    pub async fn new_with_player() -> Result<(Self, Option<Player>), GamploError> {
         let token = get_token()?;
         Self::from_token_with_player(token).await
     }
-    pub async fn get_player(&self) -> anyhow::Result<Option<Player>> {
+    /// Gets the authenticated player for this client, if available.
+    pub async fn get_player(&self) -> Result<Option<Player>, GamploError> {
         let value = self
             .client
-            .get(url_path("/api/sdk/player"))
+            .get(evaluate_url_path("/api/sdk/player"))
             .header("x-sdk-session", self.session_id.clone())
             .send()
             .await?
@@ -95,68 +117,77 @@ impl GamploClient {
 
         let player_value = value
             .get("player")
-            .ok_or_else(|| anyhow!("Failed to get player from response: {:?}", value))?;
+            .ok_or_else(|| GamploError::MissingField {
+                field: "player".to_string(),
+                response: format!("{:?}", value),
+            })?;
 
         if player_value.is_null() {
             return Ok(None);
         }
 
         let player: Player = serde_json::from_value(player_value.clone()).map_err(|err| {
-            anyhow!(
-                "Failed to deserialize player: {:?}, error: {:?}",
-                player_value,
-                err
-            )
+            GamploError::Deserialization {
+                type_name: "Player".to_string(),
+                data: format!("{:?}", player_value),
+                source: err,
+            }
         })?;
 
         Ok(Some(player))
     }
-    pub async fn get_achievements(&self) -> anyhow::Result<Vec<achievement::Achievement>> {
+    /// Gets all achievements for this client.
+    pub async fn get_achievements(&self) -> Result<Vec<Achievement>, GamploError> {
         let value = self
             .client
-            .get(url_path("/api/sdk/achievements"))
+            .get(evaluate_url_path("/api/sdk/achievements"))
             .header("x-sdk-session", self.session_id.clone())
             .send()
             .await?
             .text()
             .await?
             .parse::<serde_json::Value>()?;
-        let achievements_value = value
-            .get("achievements")
-            .ok_or_else(|| anyhow!("Failed to get achievements from response: {:?}", value))?;
+        let achievements_value =
+            value
+                .get("achievements")
+                .ok_or_else(|| GamploError::MissingField {
+                    field: "achievements".to_string(),
+                    response: format!("{:?}", value),
+                })?;
         let achievements: Vec<achievement::Achievement> =
             serde_json::from_value(achievements_value.clone()).map_err(|err| {
-                anyhow!(
-                    "Failed to deserialize achievements: {:?}, error: {:?}",
-                    achievements_value,
-                    err
-                )
+                GamploError::Deserialization {
+                    type_name: "achievements".to_string(),
+                    data: format!("{:?}", achievements_value),
+                    source: err,
+                }
             })?;
 
         Ok(achievements)
     }
-    pub async fn get_saves(&self) -> anyhow::Result<Saves> {
+    /// Gets all save slots for this client.
+    pub async fn get_saves(&self) -> Result<Saves, GamploError> {
         let value = self
             .client
-            .get(url_path("/api/sdk/saves"))
+            .get(evaluate_url_path("/api/sdk/saves"))
             .header("x-sdk-session", self.session_id.clone())
             .send()
             .await?
             .text()
             .await?;
-        let saves: Saves = serde_json::from_str(&value).map_err(|err| {
-            anyhow!(
-                "Failed to deserialize saves response: {:?}, error: {:?}",
-                value,
-                err
-            )
-        })?;
+        let saves: Saves =
+            serde_json::from_str(&value).map_err(|err| GamploError::Deserialization {
+                type_name: "Saves".to_string(),
+                data: value.clone(),
+                source: err,
+            })?;
         Ok(saves)
     }
-    pub async fn get_save(&self, slot: u32) -> anyhow::Result<Option<SaveData>> {
+    /// Gets a specific save slot for this client.
+    pub async fn get_save(&self, slot: u32) -> Result<Option<SaveData>, GamploError> {
         let response = self
             .client
-            .get(url_path("/api/sdk/saves"))
+            .get(evaluate_url_path("/api/sdk/saves"))
             .query(&[("slot", slot.to_string())])
             .header("x-sdk-session", self.session_id.clone())
             .send()
@@ -165,19 +196,19 @@ impl GamploClient {
             return Ok(None);
         }
         let text = response.text().await?;
-        let save: SaveData = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(err) => {
-                return Err(anyhow!(
-                    "Failed to deserialize save: {:?}, error: {:?}",
-                    text,
-                    err
-                ));
-            }
-        };
+        let save: SaveData =
+            serde_json::from_str(&text).map_err(|err| GamploError::Deserialization {
+                type_name: "SaveData".to_string(),
+                data: text.clone(),
+                source: err,
+            })?;
         Ok(Some(save))
     }
-    pub async fn unlock(&self, achievement: &str) -> anyhow::Result<AchievementUnlockResponse> {
+    /// Unlocks an achievement for this client.
+    pub async fn unlock_achievement(
+        &self,
+        achievement: &str,
+    ) -> Result<AchievementUnlockResponse, GamploError> {
         let response = self
             .client
             .post("https://gamplo.com/api/sdk/achievements/unlock")
@@ -196,54 +227,51 @@ impl GamploClient {
 
         let parsed: serde_json::Value = serde_json::from_str(&response)?;
         if parsed.get("success").and_then(|v| v.as_bool()) != Some(true) {
-            return Err(anyhow!(
+            return Err(GamploError::ApiError(format!(
                 "Failed to unlock achievement: {}, response: {:?}",
-                achievement,
-                parsed
-            ));
+                achievement, parsed
+            )));
         }
         let response: AchievementUnlockResponse = serde_json::from_value(parsed)?;
         Ok(response)
     }
-
-    pub async fn unlock_with_secret(
+    /// Unlocks an achievement for this client with an API secret. For use on the server only as the API secret should never be exposed to clients.
+    #[cfg(feature = "server")]
+    pub async fn unlock_achievement_with_secret(
         &self,
         achievement: &str,
-        api_secret: Option<&str>,
-    ) -> anyhow::Result<AchievementUnlockResponse> {
-        let mut req = self
+        api_secret: &str,
+    ) -> Result<AchievementUnlockResponse, GamploError> {
+        let req = self
             .client
             .post("https://gamplo.com/api/sdk/achievements/unlock")
             .header("Content-Type", "application/json")
-            .header("x-sdk-session", self.session_id.clone());
-        if let Some(secret) = api_secret {
-            req = req.header("x-api-secret", secret.to_string());
-        }
+            .header("x-sdk-session", self.session_id.clone())
+            .header("x-api-secret", api_secret.to_string());
         let body = json!({ "key": achievement }).to_string();
         let text = req.body(body).send().await?.text().await?;
         let parsed: serde_json::Value = serde_json::from_str(&text)?;
         if parsed.get("success").and_then(|v| v.as_bool()) != Some(true) {
-            return Err(anyhow!(
+            return Err(GamploError::ApiError(format!(
                 "Failed to unlock achievement: {}, response: {:?}",
-                achievement,
-                parsed
-            ));
+                achievement, parsed
+            )));
         }
         Ok(serde_json::from_value(parsed)?)
     }
-
+    /// Saves data to a specific slot for this client. If `slot` is `None`, it will save to the first available slot.
     pub async fn save(
         &self,
         slot: Option<u32>,
         data: serde_json::Value,
-    ) -> anyhow::Result<save::SaveWriteResponse> {
+    ) -> Result<SaveWriteResponse, GamploError> {
         let mut body = json!({ "data": data });
         if let Some(s) = slot {
             body["slot"] = serde_json::json!(s);
         }
         let text = self
             .client
-            .post(url_path("/api/sdk/saves"))
+            .post(evaluate_url_path("/api/sdk/saves"))
             .header("Content-Type", "application/json")
             .header("x-sdk-session", self.session_id.clone())
             .body(body.to_string())
@@ -251,36 +279,39 @@ impl GamploClient {
             .await?
             .text()
             .await?;
-        let resp: save::SaveWriteResponse = serde_json::from_str(&text)
-            .map_err(|e| anyhow!("Failed to parse save response: {:?}, error: {:?}", text, e))?;
+        let resp: save::SaveWriteResponse =
+            serde_json::from_str(&text).map_err(|e| GamploError::Deserialization {
+                type_name: "SaveWriteResponse".to_string(),
+                data: text.clone(),
+                source: e,
+            })?;
         Ok(resp)
     }
-
-    pub async fn delete_save(&self, slot: u32) -> anyhow::Result<save::SaveDeleteResponse> {
+    /// Deletes a save slot for this client.
+    pub async fn delete_save(&self, slot: u32) -> Result<save::SaveDeleteResponse, GamploError> {
         let text = self
             .client
-            .delete(url_path("/api/sdk/saves"))
+            .delete(evaluate_url_path("/api/sdk/saves"))
             .query(&[("slot", slot.to_string())])
             .header("x-sdk-session", self.session_id.clone())
             .send()
             .await?
             .text()
             .await?;
-        let resp: save::SaveDeleteResponse = serde_json::from_str(&text).map_err(|e| {
-            anyhow!(
-                "Failed to parse delete response: {:?}, error: {:?}",
-                text,
-                e
-            )
-        })?;
+        let resp: save::SaveDeleteResponse =
+            serde_json::from_str(&text).map_err(|e| GamploError::Deserialization {
+                type_name: "SaveDeleteResponse".to_string(),
+                data: text.clone(),
+                source: e,
+            })?;
         Ok(resp)
     }
-
-    pub async fn moderate(&self, text: &str) -> anyhow::Result<ModerationResult> {
+    /// Moderates text for this client. Returns whether the text is allowed or blocked, and if blocked, the reason why.
+    pub async fn moderate(&self, text: &str) -> Result<ModerationResult, GamploError> {
         let body = json!({ "text": text }).to_string();
         let text = self
             .client
-            .post(url_path("/api/sdk/moderate"))
+            .post(evaluate_url_path("/api/sdk/moderate"))
             .header("Content-Type", "application/json")
             .header("x-sdk-session", self.session_id.clone())
             .body(body)
@@ -288,55 +319,65 @@ impl GamploClient {
             .await?
             .text()
             .await?;
-        let resp: ModerationResult = serde_json::from_str(&text).map_err(|e| {
-            anyhow!(
-                "Failed to parse moderation response: {:?}, error: {:?}",
-                text,
-                e
-            )
-        })?;
+        let resp = {
+            let parsed: serde_json::Value = serde_json::from_str(&text)?;
+            if parsed.get("blocked").and_then(|v| v.as_bool()) == Some(true) {
+                ModerationResult::Blocked {
+                    reason: parsed
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                }
+            } else {
+                ModerationResult::Allowed
+            }
+        };
         Ok(resp)
     }
-
-    // Expose the current session ID for diagnostics/status UIs.
+    /// Returns the session ID for this client.
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModerationResult {
-    pub blocked: bool,
-    pub reason: Option<String>,
+/// Represents the result of a moderation check.
+///
+/// If the text is blocked, it includes an optional reason for why it was blocked. If the text is allowed, there is no reason.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+pub enum ModerationResult {
+    Blocked { reason: Option<String> },
+    Allowed,
+}
+impl ModerationResult {
+    pub fn is_blocked(&self) -> bool {
+        match self {
+            ModerationResult::Blocked { .. } => true,
+            ModerationResult::Allowed => false,
+        }
+    }
+
+    pub fn reason(&self) -> Option<&String> {
+        match self {
+            ModerationResult::Blocked { reason } => reason.as_ref(),
+            ModerationResult::Allowed => None,
+        }
+    }
 }
 
-pub fn get_token() -> anyhow::Result<String> {
-    if let Ok(token) = std::env::var("GAMPLO_TOKEN") {
-        return Ok(token);
+/// Attempts to get the Gamplo authentication token.
+///
+/// This function always returns an error as token auto-detection is disabled.
+/// Use [`Gamplo::from_token`] to provide a token explicitly.
+pub fn get_token() -> Result<String, GamploError> {
+    let window = web_sys::window().ok_or_else(|| GamploError::TokenNotFound(String::from("Failed to get window object")))?;
+    let url = Reflect::get(&window, &JsValue::from_str("GAMPLO_TOKEN")).map_err(|_| GamploError::TokenNotFound(String::from("Failed to access GAMPLO_TOKEN from window")))?;
+    if url.is_undefined() {
+        return Err(GamploError::TokenNotFound(String::from("GAMPLO_TOKEN is not defined on the window object")));
     }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        Err(anyhow!(
-            "GAMPLO_TOKEN not set and not running in a browser (WASM)"
-        ))
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        let window = web_sys::window().expect("no global `window` exists");
-        let location = window.location();
-        let search = location
-            .search()
-            .map_err(|jsval| anyhow!("Failed to get search from location: {:?}", jsval))?;
-        let query = url::form_urlencoded::parse(search.as_bytes()).collect::<Vec<_>>();
-        let token = query.into_iter().find(|(key, _)| key == "gamplo_token").map(|(_, value)| value.into_owned()).ok_or_else(|| {
-                anyhow!("GAMPLO_TOKEN environment variable not set and no token query parameter found in URL")
-        })?;
-        Ok(token)
-    }
+    let token = url.as_string().unwrap();
+    Ok(token)
 }
+
 #[cfg(test)]
 mod tests {
     use crate::save::SaveData;
