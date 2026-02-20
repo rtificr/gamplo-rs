@@ -24,7 +24,7 @@ pub enum GamploError {
     #[error("API error: {0}")]
     ApiError(String),
 
-    #[error("Token not found in environment variables or query parameters")]
+    #[error("Token not found in query parameters")]
     TokenNotFound(String),
 
     #[cfg(target_arch = "wasm32")]
