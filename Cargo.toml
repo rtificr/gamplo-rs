@@ -3,9 +3,9 @@ name = "gamplo"
 authors = ["Jay Churchill"]
 categories = ["api-bindings", "game-development", "authentication"]
 repository = "https://github.com/rtificr/gamplo-rs"
-description = "WIP HTTPS Gamplo Client API. Testing underway, feel free to make contributions"
+description = "HTTPS Gamplo Client API"
 license = "GPL-3.0-only"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 [profile.release]
